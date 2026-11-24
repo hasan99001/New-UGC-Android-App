@@ -1,3 +1,4 @@
+
 name: Build UGC Android APK
 
 on:
@@ -11,6 +12,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout project
         uses: actions/checkout@v4
@@ -26,36 +28,111 @@ jobs:
         with:
           gradle-version: '8.9'
 
+      - name: Extract and locate Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import zipfile
+
+          root = Path.cwd()
+          out = root / "_ugc_extracted"
+          out.mkdir(exist_ok=True)
+          processed = set()
+
+          for _ in range(6):
+              archives = [
+                  p for p in root.rglob("*.zip")
+                  if ".git" not in p.parts
+                  and "_ugc_extracted" not in p.parts
+                  and p.resolve() not in processed
+              ]
+              if not archives:
+                  break
+
+              for i, archive in enumerate(archives):
+                  processed.add(archive.resolve())
+                  dest = out / f"{archive.stem}_{len(processed)}"
+                  dest.mkdir(parents=True, exist_ok=True)
+                  print("Extracting:", archive)
+                  with zipfile.ZipFile(archive) as z:
+                      z.extractall(dest)
+
+          candidates = []
+          for p in root.rglob("settings.gradle"):
+              if ".git" not in p.parts:
+                  candidates.append(p.parent)
+
+          for p in root.rglob("settings.gradle.kts"):
+              if ".git" not in p.parts:
+                  candidates.append(p.parent)
+
+          valid = []
+          for p in set(candidates):
+              app = p / "app"
+              if (
+                  (app / "build.gradle").is_file()
+                  or (app / "build.gradle.kts").is_file()
+              ):
+                  valid.append(p)
+
+          if not valid:
+              raise SystemExit(
+                  "ERROR: No Android project found. "
+                  "ZIP must contain settings.gradle and app/build.gradle."
+              )
+
+          def score(p):
+              return (
+                  100 if (p / "app/src/main/AndroidManifest.xml").is_file() else 0
+              ) + len(list((p / "app/src/main").rglob("*"))) if (p / "app/src/main").exists() else 0
+
+          valid.sort(key=score, reverse=True)
+          project = valid[0]
+
+          print("Android project found:", project)
+          with open(root / "project_path.txt", "w") as f:
+              f.write(str(project))
+          PY
+
+          PROJECT_DIR="$(cat project_path.txt)"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
       - name: Verify project structure
         shell: bash
         run: |
           set -euo pipefail
-          test -f settings.gradle
-          test -f build.gradle
-          test -f app/build.gradle
+          cd "$PROJECT_DIR"
+          echo "Project directory: $(pwd)"
+          ls -la
+          ls -la app
           test -f app/src/main/AndroidManifest.xml
-          echo "Project root verified: $(pwd)"
-          find app/src/main -maxdepth 3 -type f | sort | head -80
+          echo "Project structure verified!"
 
       - name: Build debug APK
         shell: bash
         run: |
           set -euo pipefail
-          gradle --no-daemon --stacktrace assembleDebug
+          gradle --no-daemon --stacktrace -p "$PROJECT_DIR" assembleDebug
 
       - name: Verify APK
         shell: bash
         run: |
           set -euo pipefail
-          APK="app/build/outputs/apk/debug/app-debug.apk"
+          APK="$(find "$PROJECT_DIR/app/build/outputs/apk/debug" \
+            -name '*.apk' -type f | head -1)"
+          test -n "$APK"
           test -s "$APK"
-          ls -lh "$APK"
+          cp "$APK" UGC-debug.apk
+          ls -lh UGC-debug.apk
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: UGC-debug-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: UGC-debug.apk
           if-no-files-found: error
           retention-days: 14
           
